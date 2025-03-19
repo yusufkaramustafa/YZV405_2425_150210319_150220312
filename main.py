@@ -1,21 +1,7 @@
-import torch
-from transformers import BertTokenizer
+from dataset import get_dataloaders, debug_data_loader
 
-sentence = "İtibarlı bir kimse için başkasına elini mecburen açmak, ölmekten daha zordur."
+# Get DataLoaders
+train_loader, val_loader, tokenizer = get_dataloaders()
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased")
-
-tokens = tokenizer.tokenize(sentence)
-
-print("Tokens from base cased tokenizer \n ", tokens, "\n")
-
-tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-uncased")
-tokens = tokenizer.tokenize(sentence)
-
-print("Tokens from base uncased tokenizer \n ", tokens, "\n")
-
-tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased", strip_accents = True)
-tokens = tokenizer.tokenize(sentence)
-
-print("Tokens from strip accents cased tokenizer \n ", tokens, "\n")
-
+# Debug label alignment
+debug_data_loader(train_loader, tokenizer)
