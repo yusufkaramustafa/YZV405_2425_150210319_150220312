@@ -45,20 +45,33 @@ def preprocess_data(df, tokenizer):
     for _, row in df.iterrows():
         sentence = row["sentence"]
         idiom_indices = eval(row["indices"])  # Convert "[0, 1]" -> [0, 1]
-        tokenized_words = eval(row["tokenized_sentence"])  # Get original words
-        idiom_label_map = {idx: 1 for idx in idiom_indices}  # Mark idiom positions
+        
+        # Special case for no idiom
+        if idiom_indices == [-1]:
+            # Just process normally with no positive labels
+            idiom_label_map = {}
+        else:
+            tokenized_words = eval(row["tokenized_sentence"])  # Get original words
+            idiom_label_map = {idx: 1 for idx in idiom_indices}  # Mark idiom positions
 
         # Tokenize the sentence with WordPiece
         wordpiece_tokens = []
         label_list = []
+        
+        # Handle special case for no idiom
+        if idiom_indices == [-1]:
+            # Tokenize the full sentence
+            wordpiece_tokens = tokenizer.tokenize(sentence)
+            label_list = [0] * len(wordpiece_tokens)
+        else:
+            tokenized_words = eval(row["tokenized_sentence"])  # Get original words
+            for word_idx, word in enumerate(tokenized_words):
+                subwords = tokenizer.tokenize(word)  # Get subword tokens
+                wordpiece_tokens.extend(subwords)
 
-        for word_idx, word in enumerate(tokenized_words):
-            subwords = tokenizer.tokenize(word)  # Get subword tokens
-            wordpiece_tokens.extend(subwords)
-
-            # Assign the same label to all subwords of the idiomatic word
-            label = idiom_label_map.get(word_idx, 0)  # Default is 0 (non-idiom)
-            label_list.extend([label] * len(subwords))  # Extend to all subwords
+                # Assign the same label to all subwords of the idiomatic word
+                label = idiom_label_map.get(word_idx, 0)  # Default is 0 (non-idiom)
+                label_list.extend([label] * len(subwords))  # Extend to all subwords
         
         inputs.append(wordpiece_tokens)
         labels.append(label_list)
