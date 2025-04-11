@@ -72,83 +72,115 @@ def train_epoch(model, dataloader, optimizer, device):
         
     return epoch_loss / len(dataloader)
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, tokenizer, device):
     model.eval()
-    all_preds = []
-    all_labels = []
     val_loss = 0
+    predictions = []
+    ground_truth = []
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            # Move tensors to the configured device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            # Forward pass
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            loss = outputs['loss']
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             logits = outputs['logits']
-            
-            val_loss += loss.item()
-            
-            # Get predictions
             preds = torch.argmax(logits, dim=2)
             
-            # Only consider tokens that aren't padding
-            active_accuracy = attention_mask.view(-1) == 1
-            active_preds = preds.view(-1)[active_accuracy]
-            active_labels = labels.view(-1)[active_accuracy]
-            
-            all_preds.extend(active_preds.cpu().numpy())
-            all_labels.extend(active_labels.cpu().numpy())
+            # Process each sequence in batch
+            for seq_preds, seq_ids, seq_mask, seq_labels in zip(preds, input_ids, attention_mask, labels):
+                tokens = tokenizer.convert_ids_to_tokens(seq_ids)
+                
+                # Map subword predictions back to word-level predictions
+                word_idx = -1  # Start at -1 to account for [CLS]
+                current_word_preds = []
+                word_level_preds = []
+                
+                for token, pred in zip(tokens, seq_preds):
+                    if token == '[CLS]' or token == '[SEP]':
+                        continue
+                        
+                    if not token.startswith('##'):  # New word
+                        # Save prediction for previous word
+                        if current_word_preds:
+                            # If any subword was predicted as idiom, whole word is idiom
+                            if 1 in current_word_preds:
+                                word_level_preds.append(word_idx)
+                        word_idx += 1
+                        current_word_preds = [pred.item()]
+                    else:  # Subword
+                        current_word_preds.append(pred.item())
+                
+                # The last word
+                if current_word_preds and 1 in current_word_preds:
+                    word_level_preds.append(word_idx)
+                
+                # Get ground truth indices
+                true_indices = []
+                word_idx = -1
+                for token, label in zip(tokens, seq_labels):
+                    if token == '[CLS]' or token == '[SEP]':
+                        continue
+                    if not token.startswith('##'):
+                        word_idx += 1
+                        if label.item() == 1:
+                            true_indices.append(word_idx)
+                
+                predictions.append(word_level_preds)
+                ground_truth.append(true_indices)
+                
+                # Debug print
+                print("\nExample:")
+                print("Tokens:", tokens)
+                print("Token predictions:", seq_preds.tolist())
+                print("Mapped to word indices:", word_level_preds)
+                print("True indices:", true_indices)
     
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    report = classification_report(all_labels, all_preds)
+    # Calculate F1 scores
+    f1_scores = []
+    for pred, gold in zip(predictions, ground_truth):
+        pred_set = set(pred)
+        gold_set = set(gold)
+        intersection = len(pred_set & gold_set)
+        precision = intersection / len(pred_set) if len(pred_set) > 0 else 0
+        recall = intersection / len(gold_set) if len(gold_set) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        f1_scores.append(f1)
     
-    return val_loss / len(dataloader), accuracy, f1, report
+    mean_f1 = np.mean(f1_scores)
+    print(f"\nMean F1 Score: {mean_f1:.4f}")
+    
+    return {
+        'f1': mean_f1,
+        'loss': val_loss / len(dataloader),
+        'predictions': predictions,
+        'ground_truth': ground_truth
+    }
 
-def train_model(train_loader, val_loader, epochs=5, lr=2e-5):
-    # Set device
+def train_model(train_loader, val_loader, tokenizer, epochs=5, lr=2e-5):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Initialize model
-    model = BertForIdiomDetection()
-    model.to(device)
-    
-    # Initialize optimizer
+    model = BertForIdiomDetection().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     
-    # Training loop
     best_f1 = 0
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
         
-        # Train
+        # Training
         train_loss = train_epoch(model, train_loader, optimizer, device)
         print(f"Training loss: {train_loss:.4f}")
         
         # Evaluate
-        val_loss, accuracy, f1, report = evaluate(model, val_loader, device)
-        print(f"Validation loss: {val_loss:.4f}")
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"F1 score: {f1:.4f}")
+        metrics = evaluate(model, val_loader, tokenizer, device)
         
-        # Save best model
-        if f1 > best_f1:
-            best_f1 = f1
-            torch.save(model.state_dict(), "bert_model.pt")
+        # Save best model based on F1 score
+        if metrics['f1'] > best_f1:
+            best_f1 = metrics['f1']
+            torch.save(model.state_dict(), "best_idiom_model.pt")
             print("New best model saved!")
-            print(report)
+            print(f"F1 Score: {metrics['f1']:.4f}")
     
     return model
 
@@ -200,3 +232,79 @@ def predict_idioms(model, tokenizer, sentence, device):
             results.append((token, int(pred)))
     
     return results
+
+def debug_predictions(model, tokenizer, test_sentences, device):
+    """
+    Debug function to show the complete pipeline of tokenization, prediction, and remapping
+    """
+    model.eval()
+    
+    for sentence in test_sentences:
+        print("\n" + "="*80)
+        print(f"Original sentence: {sentence}")
+        
+        # Tokenize
+        encoding = tokenizer.encode_plus(
+            sentence,
+            truncation=True,
+            padding="max_length",
+            max_length=128,
+            return_tensors="pt"
+        )
+        
+        # Move to device
+        input_ids = encoding["input_ids"].to(device)
+        attention_mask = encoding["attention_mask"].to(device)
+        
+        # Get predictions
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs['logits']
+            preds = torch.argmax(logits, dim=2)
+        
+        # Get tokens
+        tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+        
+        # Map predictions back to words
+        word_idx = -1  # Start at -1 to account for [CLS]
+        current_word_preds = []
+        word_level_preds = []
+        words = []
+        current_word = []
+        
+        print("\nDetailed token analysis:")
+        print(f"{'Token':<15} {'Is Subword':<12} {'Prediction':<10} {'Word Index':<10}")
+        print("-" * 50)
+        
+        for token, pred in zip(tokens, preds[0]):
+            if token == '[CLS]' or token == '[SEP]' or token == '[PAD]':
+                print(f"{token:<15} {'N/A':<12} {pred.item():<10} {'N/A':<10}")
+                continue
+                
+            is_subword = token.startswith('##')
+            
+            if not is_subword:  # New word
+                # Save prediction for previous word
+                if current_word_preds:
+                    if 1 in current_word_preds:
+                        word_level_preds.append(word_idx)
+                    words.append(''.join(current_word))
+                word_idx += 1
+                current_word_preds = [pred.item()]
+                current_word = [token]
+            else:  # Subword
+                current_word_preds.append(pred.item())
+                current_word.append(token[2:])  # Remove ## prefix
+                
+            print(f"{token:<15} {str(is_subword):<12} {pred.item():<10} {word_idx:<10}")
+        
+        # Handle last word
+        if current_word_preds and 1 in current_word_preds:
+            word_level_preds.append(word_idx)
+        if current_word:
+            words.append(''.join(current_word))
+            
+        print("\nFinal Analysis:")
+        print("Reconstructed words:", words)
+        print("Word-level predictions:", word_level_preds)
+        print("Predicted idiom words:", [words[i] for i in word_level_preds])
