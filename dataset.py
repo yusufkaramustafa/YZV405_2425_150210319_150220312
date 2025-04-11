@@ -27,7 +27,7 @@ class IdiomDataset(Dataset):
         )
 
         # Add padding to labels to account for [CLS] and [SEP] tokens
-        label = [0] + label + [0]  
+        label = [0] + label + [0]  # 0 = O tag
         
         # Pad labels to match max length
         label = label + [0] * (self.max_length - len(label))
@@ -48,30 +48,50 @@ def preprocess_data(df, tokenizer):
         
         # Special case for no idiom
         if idiom_indices == [-1]:
-            # Just process normally with no positive labels
-            idiom_label_map = {}
-        else:
-            tokenized_words = eval(row["tokenized_sentence"])  # Get original words
-            idiom_label_map = {idx: 1 for idx in idiom_indices}  # Mark idiom positions
-
-        # Tokenize the sentence with WordPiece
+            # Just process normally with all O tags
+            wordpiece_tokens = tokenizer.tokenize(sentence)
+            label_list = [0] * len(wordpiece_tokens)  # 0 = O tag
+            inputs.append(wordpiece_tokens)
+            labels.append(label_list)
+            continue
+        
+        tokenized_words = eval(row["tokenized_sentence"])
+        
+        # Create BIO tags: 0=O, 1=B-IDIOM, 2=I-IDIOM
+        bio_tags = [0] * len(tokenized_words)  # Initialize all as O
+        
+        # Process idiom indices using BIO scheme
+        for i, idx in enumerate(sorted(idiom_indices)):
+            if i == 0:  # First token of idiom
+                bio_tags[idx] = 1  # B-IDIOM
+            else:
+                bio_tags[idx] = 2  # I-IDIOM
+                
+        # Special case: non-consecutive indices (e.g., [3, 5])
+        # Check if there are gaps and handle them
+        for i in range(len(idiom_indices) - 1):
+            if idiom_indices[i+1] - idiom_indices[i] > 1:
+                # If gap, the next token should be B-IDIOM, not I-IDIOM
+                bio_tags[idiom_indices[i+1]] = 1
+        
+        # Tokenize and align labels
         wordpiece_tokens = []
         label_list = []
         
-        # Handle special case for no idiom
-        if idiom_indices == [-1]:
-            # Tokenize the full sentence
-            wordpiece_tokens = tokenizer.tokenize(sentence)
-            label_list = [0] * len(wordpiece_tokens)
-        else:
-            tokenized_words = eval(row["tokenized_sentence"])  # Get original words
-            for word_idx, word in enumerate(tokenized_words):
-                subwords = tokenizer.tokenize(word)  # Get subword tokens
-                wordpiece_tokens.extend(subwords)
-
-                # Assign the same label to all subwords of the idiomatic word
-                label = idiom_label_map.get(word_idx, 0)  # Default is 0 (non-idiom)
-                label_list.extend([label] * len(subwords))  # Extend to all subwords
+        for word_idx, word in enumerate(tokenized_words):
+            subwords = tokenizer.tokenize(word)
+            wordpiece_tokens.extend(subwords)
+            
+            # First subword gets the actual BIO tag
+            label_list.append(bio_tags[word_idx])
+            
+            # Any remaining subwords get the same tag but if it's B-IDIOM, 
+            # subsequent subwords should be I-IDIOM
+            if len(subwords) > 1:
+                if bio_tags[word_idx] == 1:  # B-IDIOM
+                    label_list.extend([2] * (len(subwords) - 1))  # Rest are I-IDIOM
+                else:
+                    label_list.extend([bio_tags[word_idx]] * (len(subwords) - 1))
         
         inputs.append(wordpiece_tokens)
         labels.append(label_list)

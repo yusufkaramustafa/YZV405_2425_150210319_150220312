@@ -8,7 +8,7 @@ from torchcrf import CRF
 
 
 class BertForIdiomDetection(nn.Module):
-    def __init__(self, model_name="bert-base-multilingual-cased", num_labels=2):
+    def __init__(self, model_name="bert-base-multilingual-cased", num_labels=3):  # 3 labels: O, B-IDIOM, I-IDIOM
         super(BertForIdiomDetection, self).__init__()
         
         # Pre-trained BERT model
@@ -72,9 +72,13 @@ class BertForIdiomDetection(nn.Module):
             for i, pred_seq in enumerate(predictions):
                 pred_tensor[i, :len(pred_seq)] = torch.tensor(pred_seq, device=pred_tensor.device)
         else:
-            # During evaluation, use argmax for simplicity in metrics calculation
-            predictions = torch.argmax(emissions, dim=2)
-            pred_tensor = predictions
+            # During evaluation, use CRF decoding
+            predictions = self.crf.decode(emissions, mask=attention_mask.bool())
+            # Convert list of lists to tensor with padding
+            max_len = emissions.size(1)
+            pred_tensor = torch.zeros_like(input_ids)
+            for i, pred_seq in enumerate(predictions):
+                pred_tensor[i, :len(pred_seq)] = torch.tensor(pred_seq, device=pred_tensor.device)
         
         return {
             'loss': loss,
@@ -91,7 +95,6 @@ def evaluate(model, val_loader, tokenizer, device):
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
-            # Skip empty batches
             if batch['input_ids'].size(0) == 0:
                 continue
                 
@@ -107,74 +110,94 @@ def evaluate(model, val_loader, tokenizer, device):
                 labels=labels
             )
             
-            # Accumulate loss
             if outputs['loss'] is not None:
                 val_loss += outputs['loss'].item()
             
-            # Get predictions (now directly from model output)
             preds = outputs['predictions']
             
             # Process each sequence in batch
             for seq_preds, seq_mask, seq_labels, seq_ids in zip(preds, attention_mask, labels, input_ids):
-                # Get tokens
                 tokens = tokenizer.convert_ids_to_tokens(seq_ids)
                 
-                # Map token predictions to word indices
+                # Extract idiom indices based on BIO tags
+                # For ground truth
                 word_idx = -1
-                current_word_preds = []
-                word_level_preds = []
-                
-                for i, (token, mask, pred) in enumerate(zip(tokens, seq_mask, seq_preds)):
-                    if mask == 0:  # Skip padding
-                        continue
-                        
-                    if token == '[CLS]' or token == '[SEP]':
-                        continue
-                        
-                    if not token.startswith('##'):  # New word
-                        # Process previous word if any
-                        if current_word_preds:
-                            if 1 in current_word_preds:
-                                word_level_preds.append(word_idx)
-                        
-                        # Move to next word
-                        word_idx += 1
-                        current_word_preds = [pred.item()]
-                    else:  # Continue current word
-                        current_word_preds.append(pred.item())
-                
-                # Don't forget the last word
-                if current_word_preds and 1 in current_word_preds:
-                    word_level_preds.append(word_idx)
-                
-                # Extract ground truth word indices
-                true_word_indices = []
-                word_idx = -1
+                true_idiom_indices = []
+                current_idiom_indices = []
+                previous_tag = 0  # O tag
                 
                 for i, (token, mask, label) in enumerate(zip(tokens, seq_mask, seq_labels)):
-                    if mask == 0:  # Skip padding
-                        continue
-                        
-                    if token == '[CLS]' or token == '[SEP]':
+                    if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
                         continue
                         
                     if not token.startswith('##'):  # New word
                         word_idx += 1
-                        if label.item() == 1:
-                            if word_idx not in true_word_indices:
-                                true_word_indices.append(word_idx)
+                        
+                        # Handle end of previous idiom
+                        if previous_tag in [1, 2] and label.item() not in [1, 2]:
+                            # End of idiom
+                            if current_idiom_indices:
+                                true_idiom_indices.extend(current_idiom_indices)
+                                current_idiom_indices = []
+                        
+                        # Handle new idiom
+                        if label.item() == 1:  # B-IDIOM
+                            current_idiom_indices = [word_idx]
+                        elif label.item() == 2:  # I-IDIOM
+                            if previous_tag in [1, 2]:  # Continue idiom
+                                current_idiom_indices.append(word_idx)
+                        
+                        previous_tag = label.item()
+                
+                # Don't forget last idiom
+                if current_idiom_indices:
+                    true_idiom_indices.extend(current_idiom_indices)
+                
+                # For predictions
+                word_idx = -1
+                pred_idiom_indices = []
+                current_idiom_indices = []
+                previous_tag = 0  # O tag
+                
+                for i, (token, mask, pred) in enumerate(zip(tokens, seq_mask, seq_preds)):
+                    if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
+                        continue
+                        
+                    if not token.startswith('##'):  # New word
+                        word_idx += 1
+                        
+                        # Handle end of previous idiom
+                        if previous_tag in [1, 2] and pred.item() not in [1, 2]:
+                            # End of idiom
+                            if current_idiom_indices:
+                                pred_idiom_indices.extend(current_idiom_indices)
+                                current_idiom_indices = []
+                        
+                        # Handle new idiom
+                        if pred.item() == 1:  # B-IDIOM
+                            current_idiom_indices = [word_idx]
+                        elif pred.item() == 2:  # I-IDIOM
+                            if previous_tag in [1, 2]:  # Continue idiom
+                                current_idiom_indices.append(word_idx)
+                        
+                        previous_tag = pred.item()
+                
+                # Don't forget last idiom
+                if current_idiom_indices:
+                    pred_idiom_indices.extend(current_idiom_indices)
                 
                 # Store results
-                predictions.append(word_level_preds)
-                ground_truth.append(true_word_indices)
+                predictions.append(pred_idiom_indices)
+                ground_truth.append(true_idiom_indices)
                 
                 # Debug print for a few examples
                 if len(predictions) <= 5:
                     print("\nExample:")
                     print("Tokens:", tokens)
-                    print("Token predictions:", seq_preds.tolist())
-                    print("Mapped to word indices:", word_level_preds)
-                    print("True indices:", true_word_indices)
+                    print("True BIO tags:", seq_labels.tolist())
+                    print("Pred BIO tags:", seq_preds.tolist())
+                    print("True idiom indices:", true_idiom_indices)
+                    print("Pred idiom indices:", pred_idiom_indices)
     
     # Calculate average loss
     avg_val_loss = val_loss / max(1, total_batches)
@@ -182,9 +205,9 @@ def evaluate(model, val_loader, tokenizer, device):
     # Calculate F1 scores using competition method
     f1_scores = []
     for pred, gold in zip(predictions, ground_truth):
-        # Handle special case for no idiom ([-1])
-        if gold == [-1]:
-            if pred == [-1] or not pred:  # Empty prediction is correct for no idiom
+        # Handle special case for no idiom
+        if not gold:  # Empty gold = no idiom
+            if not pred:  # Empty pred = correctly predicted no idiom
                 f1_scores.append(1.0)
             else:
                 f1_scores.append(0.0)
@@ -325,47 +348,72 @@ def predict_idioms(model, tokenizer, sentence, device):
         )
     
     # Get predictions from CRF
-    predictions = outputs['predictions'][0]
+    preds = outputs['predictions'][0]
     
     # Map to words
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    masks = attention_mask[0]
     
-    # Convert to word-level predictions
-    word_preds = []
-    current_word = ""
-    current_pred = 0
-    word_idx = -1
+    # Extract idioms based on BIO tags
     words = []
+    bio_tags = []
+    word_idx = -1
+    idiom_indices = []
+    current_idiom = []
+    current_word = ""
+    previous_tag = 0  # O tag
     
-    for token, pred, mask in zip(tokens, predictions, attention_mask[0]):
+    for token, mask, pred in zip(tokens, masks, preds):
         if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
             continue
             
-        if not token.startswith('##'):
+        if not token.startswith('##'):  # New word
             # Save previous word
             if current_word:
                 words.append(current_word)
-                if current_pred == 1:
-                    word_preds.append(word_idx)
+                bio_tags.append(previous_tag)
+                word_idx += 1
                 
+                # Handle idiom tracking
+                if previous_tag in [1, 2] and pred.item() not in [1, 2]:  # End of idiom
+                    if current_idiom:
+                        idiom_indices.extend(current_idiom)
+                        current_idiom = []
+            
             # Start new word
-            word_idx += 1
             current_word = token
-            current_pred = pred.item()
+            previous_tag = pred.item()
+            
+            # Track idioms
+            if pred.item() == 1:  # B-IDIOM
+                current_idiom = [word_idx + 1]  # +1 because we haven't incremented yet
+            elif pred.item() == 2:  # I-IDIOM
+                if previous_tag in [1, 2]:  # Continue idiom
+                    current_idiom.append(word_idx + 1)
         else:
             # Continue current word
             current_word += token[2:]  # Remove ## prefix
-            current_pred = max(current_pred, pred.item())
     
     # Don't forget last word
     if current_word:
         words.append(current_word)
-        if current_pred == 1:
-            word_preds.append(word_idx)
+        bio_tags.append(previous_tag)
+        
+        # Handle last idiom
+        if previous_tag in [1, 2] and current_idiom:
+            idiom_indices.extend(current_idiom)
     
-    # Format results
-    results = [(word, 1 if i in word_preds else 0) for i, word in enumerate(words)]
-    return results
+    # Format results with BIO tags
+    results = []
+    for i, (word, tag) in enumerate(zip(words, bio_tags)):
+        if tag == 0:
+            results.append((word, "O"))
+        elif tag == 1:
+            results.append((word, "B-IDIOM"))
+        elif tag == 2:
+            results.append((word, "I-IDIOM"))
+    
+    return results, idiom_indices
 
 def debug_predictions(model, tokenizer, test_sentences, device):
     """
