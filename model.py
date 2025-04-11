@@ -4,6 +4,8 @@ from transformers import BertModel
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 import numpy as np
 from tqdm import tqdm
+from torchcrf import CRF
+
 
 class BertForIdiomDetection(nn.Module):
     def __init__(self, model_name="bert-base-multilingual-cased", num_labels=2):
@@ -12,9 +14,25 @@ class BertForIdiomDetection(nn.Module):
         # Pre-trained BERT model
         self.bert = BertModel.from_pretrained(model_name)
         
-        # Classification head for token-level classification
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
+        # Add a BiLSTM layer to capture context
+        self.lstm = nn.LSTM(
+            input_size=self.bert.config.hidden_size,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2
+        )
+        
+        # Classification layers
+        self.dropout = nn.Dropout(0.2)
+        self.dense = nn.Linear(512, 256)  # 512 = 2*256 (bidirectional)
+        self.activation = nn.ReLU()
+        self.norm = nn.LayerNorm(256)
+        self.classifier = nn.Linear(256, num_labels)
+        
+        # CRF layer
+        self.crf = CRF(num_labels, batch_first=True)
         
     def forward(self, input_ids, attention_mask, labels=None):
         # Get BERT outputs
@@ -24,58 +42,45 @@ class BertForIdiomDetection(nn.Module):
         )
         
         # Get token-level representations
-        sequence_output = outputs.last_hidden_state
+        sequence_output = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
         
-        # Apply dropout and classify
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)  # [batch_size, seq_len, 2]
+        # Apply BiLSTM
+        lstm_output, _ = self.lstm(sequence_output)  # [batch_size, seq_len, 2*hidden_size]
+        
+        # Apply classification layers
+        x = self.dropout(lstm_output)
+        x = self.dense(x)
+        x = self.activation(x)
+        x = self.norm(x)
+        x = self.dropout(x)
+        emissions = self.classifier(x)  # [batch_size, seq_len, num_labels]
         
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            # Only compute loss on actual tokens (where attention_mask is 1)
-            active_loss = attention_mask.view(-1) == 1
-            active_logits = logits.view(-1, 2)[active_loss]
-            active_labels = labels.view(-1)[active_loss]
+            # Create mask for CRF
+            crf_mask = attention_mask.bool()
             
-            if active_loss.sum() > 0:  # Make sure we have active tokens
-                loss = loss_fct(active_logits, active_labels)
-            else:
-                # Handle edge case with no active tokens
-                loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+            # CRF loss (negative log-likelihood)
+            loss = -self.crf(emissions, labels, mask=crf_mask, reduction='mean')
+        
+        # CRF decoding for predictions
+        if self.training or labels is None:
+            predictions = self.crf.decode(emissions, mask=attention_mask.bool())
+            # Convert list of lists to tensor with padding
+            max_len = emissions.size(1)
+            pred_tensor = torch.zeros_like(input_ids)
+            for i, pred_seq in enumerate(predictions):
+                pred_tensor[i, :len(pred_seq)] = torch.tensor(pred_seq, device=pred_tensor.device)
+        else:
+            # During evaluation, use argmax for simplicity in metrics calculation
+            predictions = torch.argmax(emissions, dim=2)
+            pred_tensor = predictions
         
         return {
             'loss': loss,
-            'logits': logits
+            'logits': emissions,
+            'predictions': pred_tensor
         }
-
-def train_epoch(model, dataloader, optimizer, device):
-    model.train()
-    epoch_loss = 0
-    
-    for batch in tqdm(dataloader, desc="Training"):
-        # Move tensors to the configured device
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-        
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-        
-        loss = outputs['loss']
-        
-        # Backward pass and optimize
-        loss.backward()
-        optimizer.step()
-        
-        epoch_loss += loss.item()
-        
-    return epoch_loss / len(dataloader)
 
 def evaluate(model, val_loader, tokenizer, device):
     model.eval()
@@ -106,8 +111,8 @@ def evaluate(model, val_loader, tokenizer, device):
             if outputs['loss'] is not None:
                 val_loss += outputs['loss'].item()
             
-            logits = outputs['logits']
-            preds = torch.argmax(logits, dim=2)
+            # Get predictions (now directly from model output)
+            preds = outputs['predictions']
             
             # Process each sequence in batch
             for seq_preds, seq_mask, seq_labels, seq_ids in zip(preds, attention_mask, labels, input_ids):
@@ -174,7 +179,7 @@ def evaluate(model, val_loader, tokenizer, device):
     # Calculate average loss
     avg_val_loss = val_loss / max(1, total_batches)
     
-    # Calculate F1 scores
+    # Calculate F1 scores using competition method
     f1_scores = []
     for pred, gold in zip(predictions, ground_truth):
         # Handle special case for no idiom ([-1])
@@ -208,10 +213,48 @@ def evaluate(model, val_loader, tokenizer, device):
         'ground_truth': ground_truth
     }
 
-def train_model(train_loader, val_loader, tokenizer, epochs=5, lr=2e-5):
+def train_model(train_loader, val_loader, tokenizer, epochs=10, lr=2e-5):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = BertForIdiomDetection().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    # Differential learning rates
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in model.named_parameters() 
+                      if not any(nd in n for nd in no_decay) and 'bert' in n],
+            'weight_decay': 0.01,
+            'lr': lr
+        },
+        {
+            'params': [p for n, p in model.named_parameters() 
+                      if any(nd in n for nd in no_decay) and 'bert' in n],
+            'weight_decay': 0.0,
+            'lr': lr
+        },
+        {
+            'params': [p for n, p in model.named_parameters() 
+                      if not any(nd in n for nd in no_decay) and 'bert' not in n],
+            'weight_decay': 0.01,
+            'lr': lr * 10  # Higher learning rate for custom layers
+        },
+        {
+            'params': [p for n, p in model.named_parameters() 
+                      if any(nd in n for nd in no_decay) and 'bert' not in n],
+            'weight_decay': 0.0,
+            'lr': lr * 10  # Higher learning rate for custom layers
+        }
+    ]
+    
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+    
+    # Learning rate scheduler
+    total_steps = len(train_loader) * epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=[lr, lr, lr*10, lr*10],
+        total_steps=total_steps
+    )
     
     best_f1 = 0
     
@@ -219,18 +262,42 @@ def train_model(train_loader, val_loader, tokenizer, epochs=5, lr=2e-5):
         print(f"\nEpoch {epoch+1}/{epochs}")
         
         # Training
-        train_loss = train_epoch(model, train_loader, optimizer, device)
-        print(f"Training loss: {train_loss:.4f}")
+        model.train()
+        train_loss = 0
+        progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
         
-        # Evaluate
+        for batch in progress_bar:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            optimizer.zero_grad()
+            outputs = model(**batch)
+            loss = outputs['loss']
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Evaluation
         metrics = evaluate(model, val_loader, tokenizer, device)
         
-        # Save best model based on F1 score
+        print(f"Epoch {epoch+1}:")
+        print(f"Training Loss: {avg_train_loss:.4f}")
+        print(f"Validation Loss: {metrics['loss']:.4f}")
+        print(f"F1 Score: {metrics['f1']:.4f}")
+        
+        # Save best model
         if metrics['f1'] > best_f1:
             best_f1 = metrics['f1']
             torch.save(model.state_dict(), "best_idiom_model.pt")
             print("New best model saved!")
-            print(f"F1 Score: {metrics['f1']:.4f}")
     
     return model
 
@@ -257,12 +324,11 @@ def predict_idioms(model, tokenizer, sentence, device):
             attention_mask=attention_mask
         )
     
-    logits = outputs["logits"]
-    predictions = torch.argmax(logits, dim=2)
+    # Get predictions from CRF
+    predictions = outputs['predictions'][0]
     
     # Map to words
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-    token_predictions = predictions[0]
     
     # Convert to word-level predictions
     word_preds = []
@@ -271,7 +337,7 @@ def predict_idioms(model, tokenizer, sentence, device):
     word_idx = -1
     words = []
     
-    for token, pred, mask in zip(tokens, token_predictions, attention_mask[0]):
+    for token, pred, mask in zip(tokens, predictions, attention_mask[0]):
         if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
             continue
             
