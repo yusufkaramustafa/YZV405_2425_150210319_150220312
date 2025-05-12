@@ -1,18 +1,19 @@
 import torch
 import torch.nn as nn
-from transformers import BertModel
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 import numpy as np
 from tqdm import tqdm
 from torchcrf import CRF
 
 
-class BertForIdiomDetection(nn.Module):
+class IdiomDetectionModel(nn.Module):
     def __init__(self, model_name="bert-base-multilingual-cased", num_labels=3):  # 3 labels: O, B-IDIOM, I-IDIOM
-        super(BertForIdiomDetection, self).__init__()
+        super(IdiomDetectionModel, self).__init__()
         
-        # Pre-trained BERT model
-        self.bert = BertModel.from_pretrained(model_name)
+        # Pre-trained model using AutoModel
+        self.bert = AutoModel.from_pretrained(model_name)
         
         # Add a BiLSTM layer to capture context
         self.lstm = nn.LSTM(
@@ -24,6 +25,14 @@ class BertForIdiomDetection(nn.Module):
             dropout=0.2
         )
         
+        # Add multi-head attention layer
+        self.attention = nn.MultiheadAttention(
+            embed_dim=512,  # 2*256 from BiLSTM
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+        
         # Classification layers
         self.dropout = nn.Dropout(0.2)
         self.dense = nn.Linear(512, 256)  # 512 = 2*256 (bidirectional)
@@ -33,6 +42,10 @@ class BertForIdiomDetection(nn.Module):
         
         # CRF layer
         self.crf = CRF(num_labels, batch_first=True)
+        
+        # Focal loss parameters
+        self.alpha = 2.0  # Focusing parameter
+        self.gamma = 0.25  # Class balancing parameter
         
     def forward(self, input_ids, attention_mask, labels=None):
         # Get BERT outputs
@@ -47,8 +60,19 @@ class BertForIdiomDetection(nn.Module):
         # Apply BiLSTM
         lstm_output, _ = self.lstm(sequence_output)  # [batch_size, seq_len, 2*hidden_size]
         
+        # Apply multi-head attention
+        attn_output, _ = self.attention(
+            query=lstm_output,
+            key=lstm_output,
+            value=lstm_output,
+            key_padding_mask=~attention_mask.bool()  # Convert mask: 1->valid, 0->padding
+        )
+        
+        # Add residual connection from LSTM output to attention output
+        combined = attn_output + lstm_output
+        
         # Apply classification layers
-        x = self.dropout(lstm_output)
+        x = self.dropout(combined)
         x = self.dense(x)
         x = self.activation(x)
         x = self.norm(x)
@@ -60,8 +84,31 @@ class BertForIdiomDetection(nn.Module):
             # Create mask for CRF
             crf_mask = attention_mask.bool()
             
-            # CRF loss (negative log-likelihood)
-            loss = -self.crf(emissions, labels, mask=crf_mask, reduction='mean')
+            # Standard CRF loss (negative log-likelihood)
+            crf_loss = -self.crf(emissions, labels, mask=crf_mask, reduction='mean')
+            
+            # Add focal loss component
+            # Compute softmax probabilities
+            probs = torch.softmax(emissions, dim=-1)
+            # Get probability of correct class
+            pt = probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            # Apply focusing parameter
+            focal_weight = (1 - pt) ** self.alpha
+            # Compute cross entropy loss
+            ce_loss = F.cross_entropy(
+                emissions.view(-1, emissions.size(-1)), 
+                labels.view(-1), 
+                reduction='none'
+            )
+            # Apply mask to ignore padding
+            ce_loss = ce_loss.view(emissions.size(0), emissions.size(1))
+            masked_ce_loss = ce_loss * attention_mask.float()
+            # Apply focal weighting
+            focal_weight = focal_weight * attention_mask.float()
+            focal_loss = (focal_weight * masked_ce_loss).sum() / attention_mask.sum()
+            
+            # Combined loss
+            loss = crf_loss + self.gamma * focal_loss
         
         # CRF decoding for predictions
         if self.training or labels is None:
@@ -117,6 +164,10 @@ def evaluate(model, val_loader, tokenizer, device):
             
             # Process each sequence in batch
             for seq_preds, seq_mask, seq_labels, seq_ids in zip(preds, attention_mask, labels, input_ids):
+                # Only process sequences with valid inputs
+                if seq_mask.sum() == 0:
+                    continue
+                    
                 tokens = tokenizer.convert_ids_to_tokens(seq_ids)
                 
                 # Extract idiom indices based on BIO tags
@@ -129,8 +180,18 @@ def evaluate(model, val_loader, tokenizer, device):
                 for i, (token, mask, label) in enumerate(zip(tokens, seq_mask, seq_labels)):
                     if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
                         continue
+                    
+                    # Handle different tokenizer special tokens
+                    is_subword = False
+                    if token.startswith('##'):  # BERT style
+                        is_subword = True
+                    elif token.startswith('▁'):  # XLM-R style
+                        is_subword = False
+                    elif i > 0 and not token.startswith('Ġ') and not tokens[i-1] in ['[CLS]', '[SEP]', '[PAD]']:
+                        # RoBERTa, DeBERTa style subwords don't have a prefix if they continue a word
+                        is_subword = True
                         
-                    if not token.startswith('##'):  # New word
+                    if not is_subword:  # New word
                         word_idx += 1
                         
                         # Handle end of previous idiom
@@ -162,8 +223,18 @@ def evaluate(model, val_loader, tokenizer, device):
                 for i, (token, mask, pred) in enumerate(zip(tokens, seq_mask, seq_preds)):
                     if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
                         continue
+                    
+                    # Handle different tokenizer special tokens
+                    is_subword = False
+                    if token.startswith('##'):  # BERT style
+                        is_subword = True
+                    elif token.startswith('▁'):  # XLM-R style
+                        is_subword = False
+                    elif i > 0 and not token.startswith('Ġ') and not tokens[i-1] in ['[CLS]', '[SEP]', '[PAD]']:
+                        # RoBERTa, DeBERTa style subwords don't have a prefix if they continue a word
+                        is_subword = True
                         
-                    if not token.startswith('##'):  # New word
+                    if not is_subword:  # New word
                         word_idx += 1
                         
                         # Handle end of previous idiom
@@ -238,7 +309,7 @@ def evaluate(model, val_loader, tokenizer, device):
 
 def train_model(train_loader, val_loader, tokenizer, epochs=10, lr=2e-5):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = BertForIdiomDetection().to(device)
+    model = IdiomDetectionModel().to(device)
     
     # Differential learning rates
     no_decay = ['bias', 'LayerNorm.weight']
@@ -363,11 +434,30 @@ def predict_idioms(model, tokenizer, sentence, device):
     current_word = ""
     previous_tag = 0  # O tag
     
-    for token, mask, pred in zip(tokens, masks, preds):
-        if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
+    # Get tokenizer type for handling subwords
+    if hasattr(tokenizer, 'name_or_path'):
+        tokenizer_name = tokenizer.name_or_path.lower()
+    else:
+        tokenizer_name = type(tokenizer).__name__.lower()
+    
+    is_bert_type = 'bert' in tokenizer_name
+    is_roberta_type = 'roberta' in tokenizer_name or 'deberta' in tokenizer_name
+    is_xlm_type = 'xlm' in tokenizer_name
+    
+    for i, (token, mask, pred) in enumerate(zip(tokens, masks, preds)):
+        if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]', '<s>', '</s>', '<pad>']:
             continue
             
-        if not token.startswith('##'):  # New word
+        # Check if this is a subword token based on tokenizer type
+        is_subword = False
+        if is_bert_type and token.startswith('##'):
+            is_subword = True
+        elif is_xlm_type and token.startswith('▁') and i > 0:
+            is_subword = False  # XLM-R uses ▁ for start of new word
+        elif is_roberta_type and i > 0 and not token.startswith('Ġ') and tokens[i-1] not in ['[CLS]', '[SEP]', '[PAD]', '<s>', '</s>', '<pad>']:
+            is_subword = True
+            
+        if not is_subword:  # New word
             # Save previous word
             if current_word:
                 words.append(current_word)
@@ -381,7 +471,13 @@ def predict_idioms(model, tokenizer, sentence, device):
                         current_idiom = []
             
             # Start new word
-            current_word = token
+            if is_xlm_type and token.startswith('▁'):
+                current_word = token[1:]  # Remove ▁ prefix for XLM-R
+            elif is_roberta_type and token.startswith('Ġ'):
+                current_word = token[1:]  # Remove Ġ prefix for RoBERTa
+            else:
+                current_word = token
+                
             previous_tag = pred.item()
             
             # Track idioms
@@ -392,7 +488,10 @@ def predict_idioms(model, tokenizer, sentence, device):
                     current_idiom.append(word_idx + 1)
         else:
             # Continue current word
-            current_word += token[2:]  # Remove ## prefix
+            if is_bert_type and token.startswith('##'):
+                current_word += token[2:]  # Remove ## prefix for BERT
+            else:
+                current_word += token  # No prefix for other tokenizers' subwords
     
     # Don't forget last word
     if current_word:
@@ -421,6 +520,22 @@ def debug_predictions(model, tokenizer, test_sentences, device):
     """
     model.eval()
     
+    # Get tokenizer type for handling subwords
+    if hasattr(tokenizer, 'name_or_path'):
+        tokenizer_name = tokenizer.name_or_path.lower()
+    else:
+        tokenizer_name = type(tokenizer).__name__.lower()
+    
+    is_bert_type = 'bert' in tokenizer_name
+    is_roberta_type = 'roberta' in tokenizer_name or 'deberta' in tokenizer_name
+    is_xlm_type = 'xlm' in tokenizer_name
+    
+    # Get tokenizer's special tokens
+    cls_token = tokenizer.cls_token
+    sep_token = tokenizer.sep_token
+    pad_token = tokenizer.pad_token
+    special_tokens = [cls_token, sep_token, pad_token]
+    
     for sentence in test_sentences:
         print("\n" + "="*80)
         print(f"Original sentence: {sentence}")
@@ -448,7 +563,7 @@ def debug_predictions(model, tokenizer, test_sentences, device):
         tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
         
         # Map predictions back to words
-        word_idx = -1  # Start at -1 to account for [CLS]
+        word_idx = -1  # Start at -1 to account for special tokens
         current_word_preds = []
         word_level_preds = []
         words = []
@@ -458,25 +573,43 @@ def debug_predictions(model, tokenizer, test_sentences, device):
         print(f"{'Token':<15} {'Is Subword':<12} {'Prediction':<10} {'Word Index':<10}")
         print("-" * 50)
         
-        for token, pred in zip(tokens, preds[0]):
-            if token == '[CLS]' or token == '[SEP]' or token == '[PAD]':
+        for i, (token, pred) in enumerate(zip(tokens, preds[0])):
+            if token in special_tokens:
                 print(f"{token:<15} {'N/A':<12} {pred.item():<10} {'N/A':<10}")
                 continue
-                
-            is_subword = token.startswith('##')
             
+            # Check if this is a subword token based on tokenizer type
+            is_subword = False
+            if is_bert_type and token.startswith('##'):
+                is_subword = True
+            elif is_xlm_type and token.startswith('▁') and i > 0:
+                is_subword = False  # XLM-R uses ▁ for start of new word
+            elif is_roberta_type and i > 0 and not token.startswith('Ġ') and tokens[i-1] not in special_tokens:
+                is_subword = True
+                
             if not is_subword:  # New word
                 # Save prediction for previous word
                 if current_word_preds:
                     if 1 in current_word_preds:
                         word_level_preds.append(word_idx)
-                    words.append(''.join(current_word))
+                    if current_word:
+                        words.append(''.join(current_word))
                 word_idx += 1
                 current_word_preds = [pred.item()]
-                current_word = [token]
+                
+                # Process the token based on tokenizer type
+                if is_xlm_type and token.startswith('▁'):
+                    current_word = [token[1:]]  # Remove ▁ prefix for XLM-R
+                elif is_roberta_type and token.startswith('Ġ'):
+                    current_word = [token[1:]]  # Remove Ġ prefix for RoBERTa
+                else:
+                    current_word = [token]
             else:  # Subword
                 current_word_preds.append(pred.item())
-                current_word.append(token[2:])  # Remove ## prefix
+                if is_bert_type and token.startswith('##'):
+                    current_word.append(token[2:])  # Remove ## prefix for BERT
+                else:
+                    current_word.append(token)  # No prefix removal for other tokenizers
                 
             print(f"{token:<15} {str(is_subword):<12} {pred.item():<10} {word_idx:<10}")
         
@@ -489,4 +622,4 @@ def debug_predictions(model, tokenizer, test_sentences, device):
         print("\nFinal Analysis:")
         print("Reconstructed words:", words)
         print("Word-level predictions:", word_level_preds)
-        print("Predicted idiom words:", [words[i] for i in word_level_preds])
+        print("Predicted idiom words:", [words[i] for i in word_level_preds if i < len(words)])

@@ -1,6 +1,6 @@
 import pandas as pd
 import torch
-from transformers import BertTokenizer
+from transformers import AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 
 class IdiomDataset(Dataset):
@@ -18,7 +18,7 @@ class IdiomDataset(Dataset):
         label = self.labels[idx]
 
         # Tokenize and pad inputs
-        encoding = self.tokenizer.encode_plus(
+        encoding = self.tokenizer(
             sentence,
             truncation=True,
             padding="max_length",
@@ -26,21 +26,29 @@ class IdiomDataset(Dataset):
             return_tensors="pt"
         )
 
-        # Add padding to labels to account for [CLS] and [SEP] tokens
-        label = [0] + label + [0]  # 0 = O tag
+        # Handle label padding properly to match tokenized input
+        # The issue might be that our labels don't match the tokenization exactly
+        if len(label) > self.max_length - 2:  # Account for [CLS] and [SEP]
+            label = label[:self.max_length - 2]
+            
+        # Add [CLS] and [SEP] token labels (always 0 = 'O' tag)
+        padded_label = [0] + label + [0]
         
-        # Pad labels to match max length
-        label = label + [0] * (self.max_length - len(label))
-        label = torch.tensor(label[:self.max_length], dtype=torch.long)
+        # Pad the rest with 0s
+        padded_label = padded_label + [0] * (self.max_length - len(padded_label))
+        
+        # Convert to tensor and ensure we don't exceed max_length
+        padded_label = torch.tensor(padded_label[:self.max_length], dtype=torch.long)
 
         return {
             "input_ids": encoding["input_ids"].squeeze(),
             "attention_mask": encoding["attention_mask"].squeeze(),
-            "labels": label
+            "labels": padded_label
         }
 
 def preprocess_data(df, tokenizer):
-    inputs, labels = [], []
+    inputs = []
+    labels = []
 
     for _, row in df.iterrows():
         sentence = row["sentence"]
@@ -48,10 +56,12 @@ def preprocess_data(df, tokenizer):
         
         # Special case for no idiom
         if idiom_indices == [-1]:
-            # Just process normally with all O tags
-            wordpiece_tokens = tokenizer.tokenize(sentence)
-            label_list = [0] * len(wordpiece_tokens)  # 0 = O tag
-            inputs.append(wordpiece_tokens)
+            # Process the full sentence and assign all "O" tags
+            # Don't tokenize here, just use the sentence directly
+            inputs.append(sentence)
+            # Create dummy labels that will be adjusted in __getitem__
+            tokens = tokenizer.tokenize(sentence)
+            label_list = [0] * len(tokens)  # 0 = O tag
             labels.append(label_list)
             continue
         
@@ -74,28 +84,46 @@ def preprocess_data(df, tokenizer):
                 # If gap, the next token should be B-IDIOM, not I-IDIOM
                 bio_tags[idiom_indices[i+1]] = 1
         
-        # Tokenize and align labels
-        wordpiece_tokens = []
+        # Store the original sentence
+        inputs.append(sentence)
+        
+        # Pre-tokenize to get accurate labels
+        # For each word, find how it gets tokenized and adjust labels
+        tokenizer_outputs = tokenizer(sentence, add_special_tokens=False)
+        input_ids = tokenizer_outputs["input_ids"]
+        
+        # Get all tokens and determine alignment
+        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        
+        # Re-tokenize each word in tokenized_words to build alignment
+        word_to_tokens_map = []
+        token_idx = 0
+        
+        # Attempt to align the pre-tokenized words with the tokenizer's output
         label_list = []
-        
         for word_idx, word in enumerate(tokenized_words):
-            subwords = tokenizer.tokenize(word)
-            wordpiece_tokens.extend(subwords)
+            # Get the label for this word
+            word_label = bio_tags[word_idx]
             
-            # First subword gets the actual BIO tag
-            label_list.append(bio_tags[word_idx])
+            # Find how many tokens this word was split into
+            word_tokens = tokenizer.tokenize(word)
+            num_tokens = len(word_tokens)
             
-            # Any remaining subwords get the same tag but if it's B-IDIOM, 
-            # subsequent subwords should be I-IDIOM
-            if len(subwords) > 1:
-                if bio_tags[word_idx] == 1:  # B-IDIOM
-                    label_list.extend([2] * (len(subwords) - 1))  # Rest are I-IDIOM
+            # First token gets the original label
+            label_list.append(word_label)
+            
+            # All subsequent tokens for this word get:
+            # - I-IDIOM (2) if original was B-IDIOM (1)
+            # - same label otherwise
+            if num_tokens > 1:
+                if word_label == 1:  # B-IDIOM
+                    label_list.extend([2] * (num_tokens - 1))  # Rest are I-IDIOM
                 else:
-                    label_list.extend([bio_tags[word_idx]] * (len(subwords) - 1))
+                    label_list.extend([word_label] * (num_tokens - 1))
         
-        inputs.append(wordpiece_tokens)
+        # Store the aligned labels
         labels.append(label_list)
-
+    
     return inputs, labels
 
 def debug_data_loader(train_loader, tokenizer):
@@ -116,13 +144,13 @@ def debug_data_loader(train_loader, tokenizer):
             print(f"{token}: {label}")
         break  
 
-def get_dataloaders(train_path="data/train.csv", val_path="data/eval.csv", batch_size=8, max_length=128):
+def get_dataloaders(train_path="data/train.csv", val_path="data/eval.csv", batch_size=8, max_length=128, model_name="bert-base-multilingual-cased"):
 
     df_train = pd.read_csv(train_path)
     df_val = pd.read_csv(val_path)
 
   
-    tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 
     train_inputs, train_labels = preprocess_data(df_train, tokenizer)
