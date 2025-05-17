@@ -4,12 +4,12 @@ import os
 from transformers import get_linear_schedule_with_warmup, AutoTokenizer
 from dataset import get_dataloaders
 from model import IdiomDetectionModel, evaluate
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train idiom detection model")
     parser.add_argument("--model_name", type=str, default="bert-base-multilingual-cased", 
-                        help="Model to use (default: bert-base-multilingual-cased)")
+                        help="Backbone model to use (default: bert-base-multilingual-cased)")
     parser.add_argument("--batch_size", type=int, default=16, 
                         help="Batch size (default: 16)")
     parser.add_argument("--epochs", type=int, default=10, 
@@ -43,7 +43,7 @@ def train():
     if args.fp16 and device.type == 'cuda':
         print("Mixed precision training enabled")
     elif args.fp16 and device.type != 'cuda':
-        print("Warning: Mixed precision requested but CUDA is not available. Using full precision.")
+        print("CUDA is not available, using full precision.")
     
     # Load data
     print("Loading data...")

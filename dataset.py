@@ -26,8 +26,7 @@ class IdiomDataset(Dataset):
             return_tensors="pt"
         )
 
-        # Handle label padding properly to match tokenized input
-        # The issue might be that our labels don't match the tokenization exactly
+
         if len(label) > self.max_length - 2:  # Account for [CLS] and [SEP]
             label = label[:self.max_length - 2]
             
@@ -37,7 +36,6 @@ class IdiomDataset(Dataset):
         # Pad the rest with 0s
         padded_label = padded_label + [0] * (self.max_length - len(padded_label))
         
-        # Convert to tensor and ensure we don't exceed max_length
         padded_label = torch.tensor(padded_label[:self.max_length], dtype=torch.long)
 
         return {
@@ -57,7 +55,6 @@ def preprocess_data(df, tokenizer):
         # Special case for no idiom
         if idiom_indices == [-1]:
             # Process the full sentence and assign all "O" tags
-            # Don't tokenize here, just use the sentence directly
             inputs.append(sentence)
             # Create dummy labels that will be adjusted in __getitem__
             tokens = tokenizer.tokenize(sentence)
@@ -77,7 +74,7 @@ def preprocess_data(df, tokenizer):
             else:
                 bio_tags[idx] = 2  # I-IDIOM
                 
-        # Special case: non-consecutive indices (e.g., [3, 5])
+        # Special case: non-consecutive indices 
         # Check if there are gaps and handle them
         for i in range(len(idiom_indices) - 1):
             if idiom_indices[i+1] - idiom_indices[i] > 1:
@@ -123,26 +120,8 @@ def preprocess_data(df, tokenizer):
         
         # Store the aligned labels
         labels.append(label_list)
-    
+
     return inputs, labels
-
-def debug_data_loader(train_loader, tokenizer):
-    for batch in train_loader:
-        input_ids = batch["input_ids"][0].tolist()  
-        labels = batch["labels"][0].tolist()
-
-        tokens = tokenizer.convert_ids_to_tokens(input_ids)
-
-        print("\nTokenized Sentence:")
-        print(tokens)
-
-        print("\nLabels:")
-        print(labels)
-
-        print("\nLabeled Tokens (Idioms should be 1):")
-        for token, label in zip(tokens, labels):
-            print(f"{token}: {label}")
-        break  
 
 def get_dataloaders(train_path="data/train.csv", val_path="data/eval.csv", batch_size=8, max_length=128, model_name="bert-base-multilingual-cased"):
 

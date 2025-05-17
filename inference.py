@@ -70,7 +70,7 @@ def run_inference():
         lang = row['language']
         sentence = row['sentence']
         
-        # Get prediction - call the module function instead of a class method
+        # Get prediction 
         results_tuple = predict_idioms(model, tokenizer, sentence, device)
         
         # Unpack results and idiom indices

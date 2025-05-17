@@ -14,10 +14,44 @@ class IdiomDetectionModel(nn.Module):
         
         # Pre-trained model using AutoModel
         self.bert = AutoModel.from_pretrained(model_name)
+        hidden_size = self.bert.config.hidden_size
+        
+        # Add 1D dilated convolutional layers to capture n-gram features with larger receptive fields
+        # Sequential dilated convolutions with increasing dilation rates
+        self.conv1 = nn.Conv1d(hidden_size, 256, kernel_size=3, padding=1, dilation=1)
+        self.conv2 = nn.Conv1d(256, 256, kernel_size=3, padding=2, dilation=2)
+        self.conv3 = nn.Conv1d(256, 256, kernel_size=3, padding=4, dilation=4)
+        
+        # Batch normalization for conv outputs
+        self.bn1 = nn.BatchNorm1d(256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.bn3 = nn.BatchNorm1d(256)
+        
+        # Bidirectional cross-attention between BERT and conv features
+        self.cross_attn_bert_to_conv = nn.MultiheadAttention(
+            embed_dim=256,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.cross_attn_conv_to_bert = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Projection layers for cross-attention
+        self.proj_bert = nn.Linear(hidden_size, 256)
+        self.proj_conv = nn.Linear(256, hidden_size)
+        
+        # Fusion layer after cross-attention
+        self.fusion = nn.Linear(256 + hidden_size, 256)
         
         # Add a BiLSTM layer to capture context
         self.lstm = nn.LSTM(
-            input_size=self.bert.config.hidden_size,
+            input_size=256,  # Output from fusion layer
             hidden_size=256,
             num_layers=2,
             batch_first=True,
@@ -33,12 +67,24 @@ class IdiomDetectionModel(nn.Module):
             batch_first=True
         )
         
-        # Classification layers
+        # Highway connection from BERT to final classification
+        self.highway_gate = nn.Linear(hidden_size, 512)
+        self.highway_transform = nn.Linear(hidden_size, 512)
+        
+        # Classification layers 
         self.dropout = nn.Dropout(0.2)
-        self.dense = nn.Linear(512, 256)  # 512 = 2*256 (bidirectional)
-        self.activation = nn.ReLU()
-        self.norm = nn.LayerNorm(256)
+        # First dense layer
+        self.dense1 = nn.Linear(512, 384)
+        self.bn_dense1 = nn.BatchNorm1d(384)
+        # Second dense layer
+        self.dense2 = nn.Linear(384, 256)
+        self.bn_dense2 = nn.BatchNorm1d(256)
+        # Final classification layer
         self.classifier = nn.Linear(256, num_labels)
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(384)
+        self.norm2 = nn.LayerNorm(256)
         
         # CRF layer
         self.crf = CRF(num_labels, batch_first=True)
@@ -57,8 +103,63 @@ class IdiomDetectionModel(nn.Module):
         # Get token-level representations
         sequence_output = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
         
-        # Apply BiLSTM
-        lstm_output, _ = self.lstm(sequence_output)  # [batch_size, seq_len, 2*hidden_size]
+        # Store for highway connection
+        bert_features = sequence_output
+        
+        # Prepare for convolutions - transpose for 1D convolutions [batch, channels, seq_len]
+        conv_input = sequence_output.transpose(1, 2)  # [batch_size, hidden_size, seq_len]
+        
+        # Apply sequential dilated convolutions
+        # First conv layer
+        conv1_out = self.conv1(conv_input)
+        conv1_out = self.bn1(conv1_out)
+        conv1_out = F.relu(conv1_out)
+        conv1_out = F.dropout(conv1_out, p=0.1, training=self.training)
+        
+        # Second conv layer with dilation=2
+        conv2_out = self.conv2(conv1_out)
+        conv2_out = self.bn2(conv2_out)
+        conv2_out = F.relu(conv2_out)
+        conv2_out = F.dropout(conv2_out, p=0.1, training=self.training)
+        
+        # Third conv layer with dilation=4
+        conv3_out = self.conv3(conv2_out)
+        conv3_out = self.bn3(conv3_out)
+        conv3_out = F.relu(conv3_out)
+        
+        # Transpose back to [batch_size, seq_len, channels]
+        conv_output = conv3_out.transpose(1, 2)  # [batch_size, seq_len, 256]
+        
+        # Bidirectional cross-attention
+        # Project BERT features to match conv dimensions
+        bert_proj = self.proj_bert(bert_features)
+        
+        # Conv features attend to BERT features
+        conv_enhanced, _ = self.cross_attn_bert_to_conv(
+            query=conv_output,
+            key=bert_proj,
+            value=bert_proj,
+            key_padding_mask=~attention_mask.bool()
+        )
+        
+        # Project conv features to match BERT dimensions
+        conv_proj = self.proj_conv(conv_output)
+        
+        # BERT features attend to Conv features
+        bert_enhanced, _ = self.cross_attn_conv_to_bert(
+            query=bert_features,
+            key=conv_proj,
+            value=conv_proj,
+            key_padding_mask=~attention_mask.bool()
+        )
+        
+        # Fuse cross-attended features
+        fused_features = torch.cat([conv_enhanced, bert_enhanced], dim=-1)
+        fused_features = self.fusion(fused_features)
+        fused_features = F.relu(fused_features)
+        
+        # Apply BiLSTM to capture long-range dependencies
+        lstm_output, _ = self.lstm(fused_features)  # [batch_size, seq_len, 2*hidden_size]
         
         # Apply multi-head attention
         attn_output, _ = self.attention(
@@ -71,12 +172,36 @@ class IdiomDetectionModel(nn.Module):
         # Add residual connection from LSTM output to attention output
         combined = attn_output + lstm_output
         
+        # Apply highway connection from BERT
+        # Reshape for batch norm operations
+        batch_size, seq_len, _ = combined.size()
+        
+        # Highway connection from BERT to the combined features
+        gate = torch.sigmoid(self.highway_gate(bert_features))
+        highway_out = gate * self.highway_transform(bert_features) + (1 - gate) * combined
+        
         # Apply classification layers
-        x = self.dropout(combined)
-        x = self.dense(x)
-        x = self.activation(x)
-        x = self.norm(x)
+        x = self.dropout(highway_out)
+        
+        # First dense layer
+        x = self.dense1(x)
+        x_flat = x.view(-1, 384)
+        x_flat = self.bn_dense1(x_flat)
+        x = x_flat.view(batch_size, seq_len, 384)
+        x = F.relu(x)
+        x = self.norm1(x)
         x = self.dropout(x)
+        
+        # Second dense layer
+        x = self.dense2(x)
+        x_flat = x.view(-1, 256)
+        x_flat = self.bn_dense2(x_flat)
+        x = x_flat.view(batch_size, seq_len, 256)
+        x = F.relu(x)
+        x = self.norm2(x)
+        x = self.dropout(x)
+        
+        # Final classification
         emissions = self.classifier(x)  # [batch_size, seq_len, num_labels]
         
         loss = None
@@ -84,7 +209,7 @@ class IdiomDetectionModel(nn.Module):
             # Create mask for CRF
             crf_mask = attention_mask.bool()
             
-            # Standard CRF loss (negative log-likelihood)
+            # Standard CRF loss
             crf_loss = -self.crf(emissions, labels, mask=crf_mask, reduction='mean')
             
             # Add focal loss component
@@ -180,7 +305,7 @@ def evaluate(model, val_loader, tokenizer, device):
                 for i, (token, mask, label) in enumerate(zip(tokens, seq_mask, seq_labels)):
                     if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
                         continue
-                    
+                        
                     # Handle different tokenizer special tokens
                     is_subword = False
                     if token.startswith('##'):  # BERT style
@@ -223,7 +348,7 @@ def evaluate(model, val_loader, tokenizer, device):
                 for i, (token, mask, pred) in enumerate(zip(tokens, seq_mask, seq_preds)):
                     if mask == 0 or token in ['[CLS]', '[SEP]', '[PAD]']:
                         continue
-                    
+                        
                     # Handle different tokenizer special tokens
                     is_subword = False
                     if token.startswith('##'):  # BERT style
@@ -306,94 +431,6 @@ def evaluate(model, val_loader, tokenizer, device):
         'predictions': predictions,
         'ground_truth': ground_truth
     }
-
-def train_model(train_loader, val_loader, tokenizer, epochs=10, lr=2e-5):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = IdiomDetectionModel().to(device)
-    
-    # Differential learning rates
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {
-            'params': [p for n, p in model.named_parameters() 
-                      if not any(nd in n for nd in no_decay) and 'bert' in n],
-            'weight_decay': 0.01,
-            'lr': lr
-        },
-        {
-            'params': [p for n, p in model.named_parameters() 
-                      if any(nd in n for nd in no_decay) and 'bert' in n],
-            'weight_decay': 0.0,
-            'lr': lr
-        },
-        {
-            'params': [p for n, p in model.named_parameters() 
-                      if not any(nd in n for nd in no_decay) and 'bert' not in n],
-            'weight_decay': 0.01,
-            'lr': lr * 10  # Higher learning rate for custom layers
-        },
-        {
-            'params': [p for n, p in model.named_parameters() 
-                      if any(nd in n for nd in no_decay) and 'bert' not in n],
-            'weight_decay': 0.0,
-            'lr': lr * 10  # Higher learning rate for custom layers
-        }
-    ]
-    
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
-    
-    # Learning rate scheduler
-    total_steps = len(train_loader) * epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=[lr, lr, lr*10, lr*10],
-        total_steps=total_steps
-    )
-    
-    best_f1 = 0
-    
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        
-        # Training
-        model.train()
-        train_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
-        
-        for batch in progress_bar:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            
-            optimizer.zero_grad()
-            outputs = model(**batch)
-            loss = outputs['loss']
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            optimizer.step()
-            scheduler.step()
-            
-            train_loss += loss.item()
-            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
-        
-        avg_train_loss = train_loss / len(train_loader)
-        
-        # Evaluation
-        metrics = evaluate(model, val_loader, tokenizer, device)
-        
-        print(f"Epoch {epoch+1}:")
-        print(f"Training Loss: {avg_train_loss:.4f}")
-        print(f"Validation Loss: {metrics['loss']:.4f}")
-        print(f"F1 Score: {metrics['f1']:.4f}")
-        
-        # Save best model
-        if metrics['f1'] > best_f1:
-            best_f1 = metrics['f1']
-            torch.save(model.state_dict(), "best_idiom_model.pt")
-            print("New best model saved!")
-    
-    return model
 
 def predict_idioms(model, tokenizer, sentence, device):
     model.eval()
@@ -513,113 +550,3 @@ def predict_idioms(model, tokenizer, sentence, device):
             results.append((word, "I-IDIOM"))
     
     return results, idiom_indices
-
-def debug_predictions(model, tokenizer, test_sentences, device):
-    """
-    Debug function to show the complete pipeline of tokenization, prediction, and remapping
-    """
-    model.eval()
-    
-    # Get tokenizer type for handling subwords
-    if hasattr(tokenizer, 'name_or_path'):
-        tokenizer_name = tokenizer.name_or_path.lower()
-    else:
-        tokenizer_name = type(tokenizer).__name__.lower()
-    
-    is_bert_type = 'bert' in tokenizer_name
-    is_roberta_type = 'roberta' in tokenizer_name or 'deberta' in tokenizer_name
-    is_xlm_type = 'xlm' in tokenizer_name
-    
-    # Get tokenizer's special tokens
-    cls_token = tokenizer.cls_token
-    sep_token = tokenizer.sep_token
-    pad_token = tokenizer.pad_token
-    special_tokens = [cls_token, sep_token, pad_token]
-    
-    for sentence in test_sentences:
-        print("\n" + "="*80)
-        print(f"Original sentence: {sentence}")
-        
-        # Tokenize
-        encoding = tokenizer.encode_plus(
-            sentence,
-            truncation=True,
-            padding="max_length",
-            max_length=128,
-            return_tensors="pt"
-        )
-        
-        # Move to device
-        input_ids = encoding["input_ids"].to(device)
-        attention_mask = encoding["attention_mask"].to(device)
-        
-        # Get predictions
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs['logits']
-            preds = torch.argmax(logits, dim=2)
-        
-        # Get tokens
-        tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-        
-        # Map predictions back to words
-        word_idx = -1  # Start at -1 to account for special tokens
-        current_word_preds = []
-        word_level_preds = []
-        words = []
-        current_word = []
-        
-        print("\nDetailed token analysis:")
-        print(f"{'Token':<15} {'Is Subword':<12} {'Prediction':<10} {'Word Index':<10}")
-        print("-" * 50)
-        
-        for i, (token, pred) in enumerate(zip(tokens, preds[0])):
-            if token in special_tokens:
-                print(f"{token:<15} {'N/A':<12} {pred.item():<10} {'N/A':<10}")
-                continue
-            
-            # Check if this is a subword token based on tokenizer type
-            is_subword = False
-            if is_bert_type and token.startswith('##'):
-                is_subword = True
-            elif is_xlm_type and token.startswith('▁') and i > 0:
-                is_subword = False  # XLM-R uses ▁ for start of new word
-            elif is_roberta_type and i > 0 and not token.startswith('Ġ') and tokens[i-1] not in special_tokens:
-                is_subword = True
-                
-            if not is_subword:  # New word
-                # Save prediction for previous word
-                if current_word_preds:
-                    if 1 in current_word_preds:
-                        word_level_preds.append(word_idx)
-                    if current_word:
-                        words.append(''.join(current_word))
-                word_idx += 1
-                current_word_preds = [pred.item()]
-                
-                # Process the token based on tokenizer type
-                if is_xlm_type and token.startswith('▁'):
-                    current_word = [token[1:]]  # Remove ▁ prefix for XLM-R
-                elif is_roberta_type and token.startswith('Ġ'):
-                    current_word = [token[1:]]  # Remove Ġ prefix for RoBERTa
-                else:
-                    current_word = [token]
-            else:  # Subword
-                current_word_preds.append(pred.item())
-                if is_bert_type and token.startswith('##'):
-                    current_word.append(token[2:])  # Remove ## prefix for BERT
-                else:
-                    current_word.append(token)  # No prefix removal for other tokenizers
-                
-            print(f"{token:<15} {str(is_subword):<12} {pred.item():<10} {word_idx:<10}")
-        
-        # Handle last word
-        if current_word_preds and 1 in current_word_preds:
-            word_level_preds.append(word_idx)
-        if current_word:
-            words.append(''.join(current_word))
-            
-        print("\nFinal Analysis:")
-        print("Reconstructed words:", words)
-        print("Word-level predictions:", word_level_preds)
-        print("Predicted idiom words:", [words[i] for i in word_level_preds if i < len(words)])
